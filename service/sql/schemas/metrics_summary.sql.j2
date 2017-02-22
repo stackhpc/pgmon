@@ -1,0 +1,126 @@
+-- -*- mode: sql -*-
+
+--
+-- Copyright 2017 StackHPC Ltd
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+--
+
+--
+-- Summary Tables Schema
+--
+-- Template Variables:
+-- * period - Time period in seconds for which to pre-aggregate against.
+--
+-- Summary tables (or roll-up, pre-aggregation, etc) are used to optimise
+-- producing time series data over wide time periods. To avoid scanning
+-- large quantities of very detailed data, only to ignore most of the
+-- detail, we pre-build certain aggregations at ingest time. These
+-- tables are then used in place of the originating detail tables when
+-- broad views are requested. For performance, it may be necessary to
+-- have multiple levels of summary, at different time resolutions. This
+-- is essentially how a number of bespoke time-series or round-robin
+-- databases work (e.g. RRD).
+--
+
+--
+-- metrics.summary_values_N
+--
+-- Table to store the pre-aggregated values. Notice that the disadvantage
+-- of this technique is that we must decide ahead of time what aggregate
+-- computations we want to support. In this case, we are supporting the
+-- following: SUM, COUNT, MIN, MAX, AVG.
+--
+-- The entries in the summary table are unique for each time period for
+-- each metric. This constraint allows us to easily implement the
+-- roll-up using UPSERT - whilst using an update for every measurement
+-- may not be the most efficient way to do this, it is very simple.
+--
+-- It is important we specify the UNIQUE constraint with timestamp
+-- first, as this means the multicolumn index created for the
+-- constraint will be created in this order. This is important as it
+-- gives us vastly better query performance than if they were reversed.
+--
+
+CREATE TABLE metrics.summary_values_{{ period }}
+    (
+        timestamp TIMESTAMPTZ,
+        metric_id INT,
+        value_sum FLOAT8,
+        value_count FLOAT8,
+        value_min FLOAT8,
+        value_max FLOAT8,
+
+        UNIQUE(metric_id, timestamp)
+    );
+
+--
+-- metrics.summary_N
+--
+-- View purely for convinience when writing queries in order to perform the
+-- join between metrics and measurements.
+--
+
+CREATE VIEW metrics.summary_{{ period }} AS
+    SELECT
+        mv.*,
+        m.*
+    FROM
+        metrics.summary_values_{{ period }} AS mv
+	INNER JOIN
+	metrics.metrics AS m
+	ON (mv.metric_id = m.id);
+
+--
+-- metrics.update_summary_N / metrics.update_summary_trigger_N
+--
+-- Trigger to perform the pre-aggregation. It rounds the timestamp of the
+-- measurement down to the requested time period, and maintains an entry
+-- unique to that timestamp, for that specific metric.
+--
+-- If there is not an entry already for the measurement, then one is
+-- inserted where the sum, min and max are all simply the value of the
+-- measurement (as it is the first measurement). The initial count of
+-- measurements is one, as there have not been any before.
+--
+-- If an entry already exists, then we aggregate it with the values already
+-- present in the row. How each column is combined depends on the aggregate
+-- it represents. For sum and count, we simply add our new value onto the
+-- existing value. For min and max, we take the smallest or greatest value
+-- between the existing min/max, and the value we are adding.
+--
+
+CREATE OR REPLACE FUNCTION metrics.update_summary_{{ period }} () RETURNS TRIGGER
+    LANGUAGE plpgsql AS $_$
+BEGIN
+    INSERT INTO metrics.summary_values_{{ period }} AS sv VALUES (
+        TO_TIMESTAMP( ((EXTRACT(EPOCH FROM NEW.timestamp) / {{ period }})::INT8 + 1) * {{ period }}),
+        NEW.metric_id,
+        NEW.value,
+        1,
+        NEW.value,
+        NEW.value)
+    ON CONFLICT (metric_id, timestamp)
+    DO UPDATE SET
+        value_sum = sv.value_sum + EXCLUDED.value_sum,
+        value_count = sv.value_count + EXCLUDED.value_count,
+        value_min = LEAST(sv.value_min, EXCLUDED.value_min),
+        value_max = GREATEST(sv.value_max, EXCLUDED.value_max)
+    ;
+    RETURN NULL;
+END;
+$_$;
+
+CREATE TRIGGER update_summary_trigger_{{ period }}
+    AFTER INSERT ON metrics.measurement_values
+    FOR EACH ROW EXECUTE PROCEDURE metrics.update_summary_{{ period }} ();

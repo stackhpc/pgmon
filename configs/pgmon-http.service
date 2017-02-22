@@ -1,0 +1,23 @@
+[Unit]
+Description=Monitoring with Postgres
+Documentation=https://github.com/stackhpc/pgmon
+Requires=network.target remote-fs.target
+After=network.target remote-fs.target
+ConditionPathExists=/opt/pgmon/pgmon-http.py
+
+[Service]
+Type=simple
+PIDFile=/var/run/pgmon-http.pid
+User=pgmon
+Group=pgmon
+WorkingDirectory=/opt/pgmon
+
+ExecStart=/usr/bin/python3 /opt/pgmon/pgmon-http.py
+ExecStop=
+
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=pgmon-http
+
+[Install]
+WantedBy=multi-user.target

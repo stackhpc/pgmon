@@ -1,0 +1,88 @@
+-- -*- mode: sql -*-
+
+--
+-- Copyright 2017 StackHPC Ltd
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+--
+
+--
+-- Log Storage Tables
+--
+
+--
+-- logs.messages
+--
+-- Primary storage table for log entries which is quite simply a direct
+-- mapping of the input data. Due to the wide variation in metadata which
+-- can be associated with the logs, it is all stored in a single column.
+-- This keeps things simple when it comes to querying and indexing.
+--
+
+CREATE TABLE logs.messages
+    (
+        timestamp TIMESTAMPTZ,
+        message TEXT,
+        dimensions JSONB
+    );
+
+--
+-- logs.*_index
+--
+-- Indexes to provide fast time-range filtering, text-search on message data,
+-- and lookup based on specific dimension values.
+--
+
+CREATE INDEX messages_timestamp_index ON logs.messages USING BRIN (timestamp);
+CREATE INDEX messages_message_index ON logs.messages USING GIN (TO_TSVECTOR('english', message));
+CREATE INDEX messages_dimensions_index ON logs.messages USING GIN (dimensions);
+
+--
+-- logs.dimensions
+--
+-- Storage of pre-computed sets of distinct fields/values.
+-- This is essentially a quick-and-dirty way of allowing faster lookup of
+-- dimension names and values without, having any functional impact on the
+-- primary logs table or its queries.
+--
+
+CREATE TABLE logs.dimensions
+    (
+        name VARCHAR,
+        value VARCHAR,
+        UNIQUE(name, value)
+    );
+
+--
+-- logs.dimensions_update / logs.dimensions_update_trigger
+--
+-- Store pre-deduplicated dimension names and values for all logs as they
+-- are loaded. There is no reason this has to be done straight away, and
+-- would be much better served as a deferred, asynchronous operation or
+-- materialized view, updated in the background.
+--
+
+CREATE OR REPLACE FUNCTION logs.dimensions_update () RETURNS TRIGGER
+    LANGUAGE plpgsql
+    AS $_$
+BEGIN
+    INSERT INTO logs.dimensions (name, value)
+        SELECT * FROM JSONB_EACH_TEXT(NEW.dimensions)
+        ON CONFLICT DO NOTHING;
+    RETURN NULL;
+END;
+$_$;
+
+CREATE TRIGGER dimensions_update_trigger
+    AFTER INSERT ON logs.messages
+    FOR EACH ROW EXECUTE PROCEDURE logs.dimensions_update ();

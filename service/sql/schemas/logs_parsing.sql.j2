@@ -1,0 +1,73 @@
+-- -*- mode: sql -*-
+
+--
+-- Copyright 2017 StackHPC Ltd
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+--
+
+--
+-- Log Parsing Tables
+--
+
+--
+-- logs.patterns
+--
+-- Storage for the patterns to attempt matching against incoming log messages.
+-- Additionally provisioned to only apply a pattern if it has a set of matching
+-- dimension values - useful for apply patterns to a particular program.
+--
+
+CREATE TABLE logs.patterns
+    (
+        id SERIAL,
+        regex VARCHAR,
+        dimension_names VARCHAR[],
+	match_dimensions JSONB,
+        add_dimensions JSONB
+    );
+
+--
+-- logs.parse_patterns / logs.parse_patterns_trigger
+--
+-- Trigger to apply configured patterns to log messages being loaded, and
+-- append any dimensions obtained from the pattern. Similarly to the
+-- management of logs.dimensions, this would be a good candidate for running
+-- asynchronously, as making the logs available earlier with basic
+-- information (e.g. severity/program) would be useful for handling peak-loads,
+-- and even allow for prioritised processing based on e.g. severity.
+--
+
+CREATE OR REPLACE FUNCTION logs.parse_patterns () RETURNS trigger
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    match JSONB;
+    pattern RECORD;
+BEGIN
+    FOR pattern IN SELECT * FROM logs.patterns LOOP
+      IF NEW.dimensions @> pattern.match_dimensions THEN
+        match := JSONB_OBJECT(pattern.dimension_names,
+	                      REGEXP_MATCHES(NEW.message, pattern.regex));
+        IF match IS NOT NULL THEN
+          NEW.dimensions := NEW.dimensions || match || pattern.add_dimensions;
+        END IF;
+      END IF;
+    END LOOP;
+    RETURN NEW;
+END;
+$_$;
+
+CREATE TRIGGER parse_patterns_trigger
+    BEFORE INSERT ON logs.messages
+    FOR EACH ROW EXECUTE PROCEDURE logs.parse_patterns ();

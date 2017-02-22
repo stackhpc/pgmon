@@ -1,0 +1,145 @@
+-- -*- mode: sql -*-
+
+--
+-- Copyright 2017 StackHPC Ltd
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+--
+
+--
+-- metrics.collectd_insert
+--
+-- Procedure to ingest measurements from the collectd PostgreSQL plugin and
+-- in the process, tidy up the metrics somewhat. The plugin for collectd
+-- must be configured with StoreRates enabled.
+--
+
+CREATE OR REPLACE FUNCTION metrics.collectd_insert
+    (
+        in_timestamp TIMESTAMPTZ,
+	in_hostname VARCHAR,
+        in_plugin VARCHAR,
+	in_plugin_instance VARCHAR,
+	in_type VARCHAR,
+	in_type_instance VARCHAR,
+        in_value_names VARCHAR[],
+	in_type_names VARCHAR[],
+	in_values FLOAT8[]
+    )
+RETURNS VOID
+LANGUAGE plpgsql AS $_$
+DECLARE
+    val RECORD;
+    dimensions JSONB;
+BEGIN
+    dimensions := metrics.collectd_dimensions (
+      in_hostname, in_plugin, in_plugin_instance, in_type_instance
+    );
+
+    FOR val IN
+      SELECT * FROM UNNEST(in_value_names, in_type_names, in_values)
+        AS t(value_name, type_name, value)
+    LOOP
+      IF val.type_name != '''gauge''' THEN
+        RAISE EXCEPTION 'Value type must be gauge, not %', val.type_name;
+      END IF;
+      
+      INSERT INTO metrics.measurements (
+          timestamp,
+	  value,
+	  name,
+	  dimensions
+	) VALUES (
+          in_timestamp,
+	  NULLIF (val.value, FLOAT8 'NaN'),
+	  metrics.collectd_name (in_plugin, in_type, in_type_instance, val.value_name),
+	  dimensions
+        );
+    END LOOP;
+END;
+$_$;
+
+CREATE OR REPLACE FUNCTION metrics.collectd_name
+    (
+        in_plugin VARCHAR,
+	in_type VARCHAR,
+	in_type_instance VARCHAR,
+        in_value_name VARCHAR
+    )
+RETURNS VARCHAR
+LANGUAGE plpgsql AS $_$
+DECLARE
+    type_instance VARCHAR;
+    value_name VARCHAR;
+BEGIN
+    -- Handle some special cases where type_instance is a bit odd.
+    type_instance :=
+      CASE in_plugin
+        -- The irq plugin uses type_instance for the interrupt line; this is
+        -- arguably better served as a dimension than an independant metric.
+        WHEN 'irq' THEN NULL
+	ELSE in_type_instance
+      END;
+
+    -- For some reason value_name is sometimes supplied with extra quotes.
+    value_name := TRIM(BOTH '''' FROM in_value_name);
+
+    -- The name for most plugins can be nicely derived from type_instance
+    -- and value_name, though if value_name is 'value', we ignore it.
+    RETURN in_plugin || '.' || in_type
+      || COALESCE('.' || type_instance, '')
+      || COALESCE('.' || NULLIF(value_name, 'value'), '');
+END;
+$_$;
+
+CREATE OR REPLACE FUNCTION metrics.collectd_dimensions
+    (
+        in_hostname VARCHAR,
+        in_plugin VARCHAR,
+	in_plugin_instance VARCHAR,
+	in_type_instance VARCHAR
+    )
+RETURNS JSONB
+LANGUAGE plpgsql AS $_$
+DECLARE
+    dimension_name VARCHAR;
+    dimension_value VARCHAR;
+    dimensions JSONB;
+BEGIN
+    -- Determine the dimension name for the plugin_instance field.
+    dimension_name :=
+      CASE in_plugin
+        WHEN 'cpu' THEN 'core'
+	WHEN 'df' THEN 'mount'
+	WHEN 'interface' THEN 'device'
+	WHEN 'irq' THEN 'line'
+	ELSE NULL
+      END;
+
+    -- Determine the value used for the field.
+    dimension_value :=
+      CASE in_plugin
+        WHEN 'irq' THEN in_type_instance
+        ELSE in_plugin_instance
+      END;
+
+    dimensions := JSONB_BUILD_OBJECT('hostname', in_hostname);
+
+    IF dimension_name IS NOT NULL AND dimension_value IS NOT NULL THEN
+      dimensions := dimensions ||
+        JSONB_BUILD_OBJECT(dimension_name, dimension_value);
+    END IF;
+
+    RETURN dimensions;
+END;
+$_$;

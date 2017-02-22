@@ -1,0 +1,84 @@
+{# -- -*- mode: sql -*-
+--
+-- Copyright 2017 StackHPC Ltd
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+--
+
+--
+-- Metric Statistics Query
+--
+-- Templates: group_by, statistics, period, dimensions
+-- Arguments: group_by, period, start_time, end_time, metric_name, dimensions
+--
+#}
+SELECT
+    {#
+    -- Select each of the dimensions values contributing to the grouping.
+    -- We return these as an array for convinience in the Python
+    #}
+    ARRAY[
+        {% if group_by is not none %}
+        {% for g in group_by %}
+	dimensions ->> (%(group_by)s)[{{ loop.index }}]
+	{% if not loop.last %},{% endif %}
+        {% endfor %}
+	{% endif %}
+    ]::VARCHAR[] AS dimensions,
+    {#
+    -- Rounded timestamp to group points from each time period.
+    #}
+    TO_TIMESTAMP( ((EXTRACT(EPOCH FROM timestamp) / %(period)s)::INT8 + 1) * %(period)s) AS timestamp,
+    {#
+    -- Select each of the statistics from the view that was requested.
+    #}
+    {% set comma = joiner(",") %}
+    {% if 'avg' in statistics %}
+    {{ comma() }}
+    ( SUM(value_sum) / SUM(value_count) ) AS avg
+    {% endif %}
+    {% if 'min' in statistics %}
+    {{ comma() }}
+    ( MIN(value_min) ) AS min
+    {% endif %}
+    {% if 'max' in statistics %}
+    {{ comma() }}
+    ( MAX(value_max) ) AS max
+    {% endif %}
+    {% if 'count' in statistics %}
+    {{ comma() }}
+    ( SUM(value_count) ) AS count
+    {% endif %}
+    {% if 'sum' in statistics %}
+    {{ comma() }}
+    ( SUM(value_sum) ) AS sum
+    {% endif %}
+FROM
+    {% if period < 300 %}
+    metrics.summary_noop
+    {% else %}
+    metrics.summary_300
+    {% endif %}
+WHERE
+    timestamp BETWEEN %(start_time)s AND %(end_time)s
+    AND name = %(metric_name)s
+    {% if dimensions is not none %}
+    AND dimensions @> %(dimensions)s::JSONB
+    {% endif %}
+GROUP BY
+    1,
+    2
+ORDER BY
+    1,
+    2
+;

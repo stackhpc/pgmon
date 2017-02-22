@@ -1,0 +1,164 @@
+-- -*- mode: sql -*-
+
+--
+-- Copyright 2017 StackHPC Ltd
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+--
+
+--
+-- Metics Storage Tables
+--
+
+--
+-- metrics.metrics
+--
+-- Metric series definition table based on name and key/value dimension pairs.
+--
+
+CREATE TABLE metrics.metrics
+    (
+        id SERIAL,
+        name VARCHAR,
+        dimensions JSONB,
+	
+        UNIQUE(name, dimensions)
+    );
+
+--
+-- metrics.metrics_index
+--
+-- Additional index to aid lookup of metrics based dimension name/value.
+--
+
+CREATE INDEX metrics_index ON metrics.metrics USING GIN (dimensions);
+
+--
+-- metrics.measurement_values
+--
+-- Storage of raw unaggregated measurement values.
+--
+
+CREATE TABLE metrics.measurement_values
+    (
+        timestamp TIMESTAMPTZ,
+        value FLOAT8,
+        metric_id INT,
+        value_meta JSONB
+    );
+
+--
+-- metrics.measurement_index
+--
+-- Index for efficiently traversing the measurements for a time range within
+-- a specific metric. The column order is important for best performance when
+-- obtaining many measurements within a time range.
+--
+
+CREATE INDEX measurement_index ON metrics.measurement_values (metric_id, timestamp);
+
+--
+-- metrics.measurements
+--
+-- View of conceptual denormalised data for convinience to simplify queries.
+--
+
+CREATE VIEW metrics.measurements AS
+    SELECT
+        mv.*,
+        m.*
+    FROM
+        metrics.measurement_values AS mv
+	INNER JOIN
+	metrics.metrics AS m
+	ON (mv.metric_id = m.id);
+
+--
+-- metrics.summary_values_noop
+--
+-- Pair of views which mimic the structure of a summarised table, so that
+-- queries can be written to transparently work against either summary data
+-- or the raw measurements.
+--
+
+CREATE VIEW metrics.summary_values_noop AS
+    SELECT
+        timestamp,
+        metric_id,
+        value AS value_sum,
+        1::FLOAT8 AS value_count,
+        value AS value_min,
+        value AS value_max
+    FROM
+        metrics.measurement_values;
+
+CREATE VIEW metrics.summary_noop AS
+    SELECT
+        mv.*,
+        m.*
+    FROM
+        metrics.summary_values_noop AS mv
+        INNER JOIN
+        metrics.metrics AS m
+        ON (mv.metric_id = m.id);
+
+--
+-- metrics.create_metric
+--
+-- Create a metric if it does not exist and return the unique identifier.
+--
+
+CREATE OR REPLACE FUNCTION metrics.create_metric
+    (
+        in_name VARCHAR,
+        in_dimensions JSONB
+    )
+RETURNS INT
+LANGUAGE plpgsql AS $_$
+DECLARE
+    out_id INT;
+BEGIN
+    SELECT id INTO out_id
+      FROM metrics.metrics
+      WHERE metrics.metrics.name = in_name
+        AND metrics.metrics.dimensions = in_dimensions;
+    IF NOT FOUND THEN
+      INSERT INTO metrics.metrics ("name", "dimensions")
+      VALUES (in_name, in_dimensions)
+      RETURNING id INTO out_id;
+    END IF;
+    RETURN out_id;
+END;
+$_$;
+
+--
+-- metrics.measurements_insert
+--
+-- Rule to allow inserting into the denormalised measurements view, and the
+-- normalisation occuring transparently. The advantage of this over a
+-- procedure is that we can COPY directly into the view.
+
+CREATE OR REPLACE RULE measurements_insert AS
+    ON INSERT TO metrics.measurements
+    DO INSTEAD
+        INSERT INTO metrics.measurement_values (
+            timestamp,
+	    value,
+	    metric_id,
+	    value_meta
+	) VALUES (
+	    NEW.timestamp,
+	    NEW.value,
+	    metrics.create_metric (NEW.name, NEW.dimensions),
+	    NEW.value_meta
+	);

@@ -1,0 +1,55 @@
+---
+- include: /home/steve/ansible/add_lxd_host.yml name=pgmon
+
+- name: install postgres
+  hosts: pgmon
+  become: true
+
+  tasks:
+    
+  - name: add postgres stable respository
+    apt_repository:
+      repo: 'deb http://apt.postgresql.org/pub/repos/apt/ xenial-pgdg main'
+      state: present
+
+  - name: add postgres key
+    apt_key:
+      url: 'https://www.postgresql.org/media/keys/ACCC4CF8.asc'
+      state: present
+
+  - name: install postgres
+    apt: name=postgresql-9.6 update_cache=yes
+    
+  - name: ensure postgres started and enabled
+    service: name=postgresql enabled=yes state=started
+
+- name: install grafana
+  hosts: pgmon
+  become: true
+
+  tasks:
+
+  - name: add grafana stable respository
+    apt_repository:
+      repo: 'deb https://packagecloud.io/grafana/stable/debian/ wheezy main'
+      state: present
+
+  - name: add packagecloud key
+    apt_key:
+      url: https://packagecloud.io/gpg.key
+      state: present
+
+  - name: install grafana
+    apt: name=grafana update_cache=yes
+
+  - name: start and enable grafana
+    service: name=grafana-server enabled=yes state=started
+  
+- name: install monitoring web service
+  hosts: pgmon
+  become: true
+  
+  tasks:
+  - apt: name=python3
+  - pip: name=aiopg
+  - pip: name=aiohttp

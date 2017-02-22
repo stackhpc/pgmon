@@ -1,0 +1,427 @@
+#
+# Copyright 2017 StackHPC Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+#
+# Ansible playbook to deploy monitoring demonstration with PostgreSQL.
+#
+
+---
+- name: deploy supplements for ansible
+  hosts: all
+  become: true
+
+  tasks:
+
+  - name: install psycopg2 (python 2) for postgresql_* tasks
+    apt:
+      name: python-psycopg2
+      update_cache: yes
+
+- name: deploy postgresql
+  hosts: all
+  become: true
+
+  tasks:
+    
+  - name: add postgres stable respository
+    apt_repository:
+      repo: 'deb http://apt.postgresql.org/pub/repos/apt/ xenial-pgdg main'
+      state: present
+
+  - name: add postgres key
+    apt_key:
+      url: 'https://www.postgresql.org/media/keys/ACCC4CF8.asc'
+      state: present
+
+  - name: install postgres 9.6
+    apt:
+      name: postgresql-9.6
+      update_cache: yes
+    
+  - name: pg_hba.conf for local access only
+    copy:
+      src: configs/pg_hba.conf
+      dest: /etc/postgresql/9.6/main/pg_hba.conf
+      owner: postgres
+      group: postgres
+      mode: 0640
+    notify: restart postgres
+
+  - name: ensure postgres started and enabled
+    service:
+      name: postgresql
+      enabled: yes
+      state: started
+    
+  handlers:
+
+  - name: restart postgres
+    service:
+      name: postgresql
+      state: restarted
+      
+- name: install monitoring web service
+  hosts: all
+  become: true
+  
+  tasks:
+  - name: install apt packages
+    apt:
+      name: '{{ item }}'
+    with_items:
+    - python3
+    - python3-pip
+    - libpq-dev
+    
+  - name: install pip packages
+    pip:
+      name: '{{ item }}'
+      executable: pip3
+    with_items:
+    - aiopg
+    - aiohttp
+    - jinja2
+
+  - name: install pgmon service
+    copy:
+      src: service/
+      dest: /opt/pgmon/
+      owner: root
+      group: root
+    notify: restart server
+
+  - name: create system user for pgmon
+    user:
+      name: pgmon
+      system: yes
+      createhome: no
+      home: /opt/pgmon
+          
+  - name: systemd service file
+    template:
+      src: configs/pgmon-http.service
+      dest: /etc/systemd/system/pgmon-http.service
+      owner: root
+      group: root
+      mode: 0644
+    notify:
+    - reload units
+    - restart server
+
+  - name: create pgmon database
+    postgresql_db:
+      name: pgmon
+    become_user: postgres
+
+  - name: create pgmon schemas
+    command: /usr/bin/python3 pgmon-schema.py
+    args:
+      chdir: /opt/pgmon/
+    become_user: postgres
+    
+  - name: create pgmon database user
+    postgresql_user:
+      db: pgmon
+      name: pgmon
+    become_user: postgres
+
+  - name: grant pgmon usage to metrics schema
+    postgresql_privs:
+      db: pgmon
+      type: schema
+      privs: USAGE
+      objs: metrics
+      role: pgmon
+    become_user: postgres
+
+  - name: grant pgmon usage to logs schema
+    postgresql_privs:
+      db: pgmon
+      type: schema
+      privs: USAGE
+      objs: logs
+      role: pgmon
+    become_user: postgres
+
+  - name: grant pgmon read-only to metrics schema tables
+    postgresql_privs:
+      db: pgmon
+      type: table
+      schema: metrics
+      privs: SELECT
+      objs: ALL_IN_SCHEMA
+      role: pgmon
+    become_user: postgres
+
+  - name: grant pgmon read-only to logs schema tables
+    postgresql_privs:
+      db: pgmon
+      type: table
+      schema: logs
+      privs: SELECT
+      objs: ALL_IN_SCHEMA
+      role: pgmon
+    become_user: postgres
+
+  - name: ensure server started and enabled
+    service:
+      name: pgmon-http
+      enabled: yes
+      state: started
+
+  handlers:
+
+  - name: restart server
+    service:
+      name: pgmon-http
+      state: restarted
+      
+  - name: reload units
+    command: systemctl daemon-reload
+      
+- name: deploy grafana
+  hosts: all
+  become: true
+
+  vars:
+    data_source: |
+      {
+        "access": "proxy",
+        "isDefault": false,
+        "name": "PGMon",
+        "type": "pgmon-datasource",
+        "url": "http://localhost:8080/"
+      }
+  
+  tasks:
+
+  - name: add grafana stable respository
+    apt_repository:
+      repo: 'deb https://packagecloud.io/grafana/stable/debian/ wheezy main'
+      state: present
+
+  - name: add packagecloud key
+    apt_key:
+      url: https://packagecloud.io/gpg.key
+      state: present
+
+  - name: install grafana
+    apt:
+      name: grafana
+      update_cache: yes
+
+  - name: copy grafana plugin
+    copy:
+      src: 'grafana-plugin/'
+      dest: '/var/lib/grafana/plugins/pgmon-grafana-plugin/'
+    notify: restart grafana
+
+  - name: install grafana.ini
+    template:
+      src: configs/grafana.ini
+      dest: /etc/grafana/grafana.ini
+    notify: restart grafana
+    
+  - name: start and enable grafana
+    service:
+      name: grafana-server
+      enabled: yes
+      state: started
+
+  - name: check datasources
+    uri:
+      method: GET
+      url: http://127.0.0.1:3000/api/datasources
+      user: admin
+      password: admin
+      return_content: true
+      force_basic_auth: true
+    register: datasources
+
+  - name: add datasources
+    uri:
+      method: POST
+      url: http://127.0.0.1:3000/api/datasources
+      user: admin
+      password: admin
+      body_format: json
+      body: "{{ data_source }}"
+      force_basic_auth: true
+    when: "'PGMon' not in datasources.json|map(attribute='name')|list"
+
+  - name: add example dashboards
+    uri:
+      method: POST
+      url: http://127.0.0.1:3000/api/dashboards/db
+      user: admin
+      password: admin
+      body_format: json
+      body:
+        dashboard: "{{ lookup('file', item) }}"
+        overwrite: true
+      force_basic_auth: true
+    with_items:
+    - configs/dashboard_metrics.json
+    - configs/dashboard_logs.json
+      
+  handlers:
+  - name: restart grafana
+    service:
+      name: grafana-server
+      state: restarted
+
+- name: deploy rsyslog collector
+  hosts: all
+  become: true
+  
+  tasks:
+  - name: postgresql rsyslog plugin
+    apt:
+      name: rsyslog-pgsql
+
+  - name: create syslog database user for rsyslog
+    postgresql_user:
+      db: pgmon
+      name: syslog
+    become_user: postgres
+
+  - name: grant syslog usage to logs schema
+    postgresql_privs:
+      db: pgmon
+      type: schema
+      privs: USAGE
+      objs: logs
+      role: syslog
+    become_user: postgres
+
+  - name: grant syslog write to logs schema tables
+    postgresql_privs:
+      db: pgmon
+      type: table
+      schema: logs
+      privs: ALL
+      objs: ALL_IN_SCHEMA
+      role: syslog
+    become_user: postgres
+
+  - name: grant syslog write to logs schema sequences
+    postgresql_privs:
+      db: pgmon
+      type: sequence
+      schema: metrics
+      privs: ALL
+      objs: ALL_IN_SCHEMA
+      role: syslog
+    become_user: postgres
+    
+  - name: rsyslog_conf
+    copy:
+      src: configs/rsyslog-rx-pgmon.conf
+      dest: /etc/rsyslog.d/rsyslog-rx-pgmon.conf
+      owner: root
+      group: root
+      mode: "u=rw,g=r,o=r"
+    notify: restart rsyslog
+
+  handlers:
+  - name: restart rsyslog
+    service:
+      name: rsyslog
+      state: restarted
+
+- name: deploy collectd collector
+  hosts: all
+  become: true
+
+  tasks:
+  - name: install collectd
+    apt: name=collectd-core
+
+  - name: create root database user for collectd
+    postgresql_user:
+      db: pgmon
+      name: root
+    become_user: postgres
+
+  - name: grant collectd usage to metrics schema
+    postgresql_privs:
+      db: pgmon
+      type: schema
+      privs: USAGE
+      objs: metrics
+      role: root
+    become_user: postgres
+
+  - name: grant collectd write to metrics schema tables
+    postgresql_privs:
+      db: pgmon
+      type: table
+      schema: metrics
+      privs: ALL
+      objs: ALL_IN_SCHEMA
+      role: root
+    become_user: postgres
+
+  - name: grant collectd write to metrics schema sequences
+    postgresql_privs:
+      db: pgmon
+      type: sequence
+      schema: metrics
+      privs: ALL
+      objs: ALL_IN_SCHEMA
+      role: root
+    become_user: postgres
+    
+  - name: collectd.conf.d
+    file:
+      state: directory
+      path: /etc/collectd/collectd.conf.d
+      owner: root
+      group: root
+      mode: 0755
+    
+  - name: collectd base config
+    template:
+      src: configs/collectd.conf
+      dest: /etc/collectd/collectd.conf
+      owner: root
+      group: root
+      mode: "u=rw,g=r,o=r"
+    notify: restart collectd
+
+  - name: collectd supplementary configs
+    template:
+      src: 'configs/{{ item }}'
+      dest: '/etc/collectd/collectd.conf.d/{{ item }}'
+      owner: root
+      group: root
+      mode: "u=rw,g=r,o=r"
+    with_items:
+    - collectd-rx-pgmon.conf
+    - collectd-metrics.conf
+    notify: restart collectd
+
+  - name: collectd service
+    service:
+      name: collectd
+      enabled: yes
+      state: started
+
+  handlers:
+  - name: restart collectd
+    service:
+      name: collectd
+      state: restarted
